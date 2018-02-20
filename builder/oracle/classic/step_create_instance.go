@@ -35,9 +35,11 @@ func (s *stepCreateInstance) Run(_ context.Context, state multistep.StateBag) mu
 		Name:       config.ImageName,
 		Shape:      config.Shape,
 		ImageList:  config.SourceImageList,
-		SSHKeys:    []string{keyName},
 		Networking: map[string]compute.NetworkingInfo{"eth0": netInfo},
 		Attributes: config.attribs,
+	}
+	if config.Comm.Type == "ssh" {
+		input.SSHKeys = []string{keyName}
 	}
 
 	instanceInfo, err := instanceClient.CreateInstance(input)
@@ -48,7 +50,7 @@ func (s *stepCreateInstance) Run(_ context.Context, state multistep.StateBag) mu
 		return multistep.ActionHalt
 	}
 
-	state.Put("instance_net", instanceInfo)
+	state.Put("instance_info", instanceInfo)
 	state.Put("instance_id", instanceInfo.ID)
 	ui.Message(fmt.Sprintf("Created instance: %s.", instanceInfo.ID))
 	return multistep.ActionContinue

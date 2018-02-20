@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-oracle-terraform/compute"
+	"github.com/hashicorp/packer/common/uuid"
 	"github.com/hashicorp/packer/helper/multistep"
 	"github.com/hashicorp/packer/packer"
 )
@@ -27,13 +28,14 @@ func (s *stepSecurity) Run(_ context.Context, state multistep.StateBag) multiste
 	ui.Say(fmt.Sprintf("Configuring security lists and rules to enable %s access...", commType))
 
 	client := state.Get("client").(*compute.ComputeClient)
+	runUUID := uuid.TimeOrderedUUID()
 
-	secListName := fmt.Sprintf("/Compute-%s/%s/Packer_%s_Allow_%s",
-		config.IdentityDomain, config.Username, commType, config.ImageName)
+	namePrefix := fmt.Sprintf("/Compute-%s/%s/", config.IdentityDomain, config.Username)
+	secListName := fmt.Sprintf("Packer_%s_Allow_%s_%s", commType, config.ImageName, runUUID)
 	secListClient := client.SecurityLists()
 	secListInput := compute.CreateSecurityListInput{
 		Description: fmt.Sprintf("Packer-generated security list to give packer %s access", commType),
-		Name:        secListName,
+		Name:        namePrefix + secListName,
 	}
 	_, err := secListClient.CreateSecurityList(&secListInput)
 	if err != nil {
@@ -51,84 +53,85 @@ func (s *stepSecurity) Run(_ context.Context, state multistep.StateBag) multiste
 	if commType == "SSH" {
 		application = "/oracle/public/ssh"
 	} else if commType == "WINRM" {
-		// Create winRM protocol; don't need to do this for SSH becasue it is
-		// built into the Oracle API.
-		// input := compute.CreateSecurityProtocolInput{
-		// 	Name:        "WINRM",
-		// 	Description: "packer-generated protocol to allow winRM communicator",
-		// 	DstPortSet:  []string{"5985", "5986"}, // TODO make configurable
-		// 	IPProtocol:  "tcp",
-		// }
-		// protocolClient := client.SecurityProtocols()
-		// secProtocol, err := protocolClient.CreateSecurityProtocol()
-		// if err != nil {
-		// 	err = fmt.Errorf("Error creating security protocol to"+
-		// 		" allow Packer to connect to Oracle instance via %s: %s", commType, err)
-		// 	ui.Error(err.Error())
-		// 	state.Put("error", err)
-		// 	return multistep.ActionHalt
-		// }
+		// Check to see whether a winRM security protocol is already defined;
+		// don't need to do this for SSH becasue it is built into the Oracle API.
+		protocolClient := client.SecurityProtocols()
+		winrmProtocol := fmt.Sprintf("WINRM_%s", runUUID)
+		getSecProtocolInput := compute.GetSecurityProtocolInput{
+			Name: namePrefix + winrmProtocol,
+		}
+		protocolInfo, err := protocolClient.GetSecurityProtocol(&getSecProtocolInput)
+		if err == nil {
+			// Protocol already exists; use it moving forward
+			log.Printf("Found security protocol %#v", protocolInfo)
+		} else {
+			// Create winRM protocol
+			input := compute.CreateSecurityProtocolInput{
+				Name:        winrmProtocol,
+				Description: "packer-generated protocol to allow winRM communicator",
+				DstPortSet:  []string{"5985", "5986", "443"}, // TODO make configurable
+				IPProtocol:  "tcp",
+			}
+			_, err = protocolClient.CreateSecurityProtocol(&input)
+			if err != nil {
+				err = fmt.Errorf("Error creating security protocol to"+
+					" allow Packer to connect to Oracle instance via %s: %s", commType, err)
+				ui.Error(err.Error())
+				state.Put("error", err)
+				return multistep.ActionHalt
+			}
+		}
+		state.Put("winrm_protocol", winrmProtocol)
 
-		// Create a security Applicatin defining WinRM
+		// Check to see whether a winRM security application is already defined
 		applicationClient := client.SecurityApplications()
-		applicationInput := compute.CreateSecurityApplicationInput{
-			Description: "Allows Packer to connect to instance via winRM",
-			DPort:       "5985-5986",
-			Name:        "packer_winRM",
-			Protocol:    "TCP",
-		}
-		_, err := applicationClient.CreateSecurityApplication(&applicationInput)
-		if err != nil {
-			err = fmt.Errorf("Error creating security application to"+
-				" allow Packer to connect to Oracle instance via %s: %s", commType, err)
-			ui.Error(err.Error())
-			state.Put("error", err)
-			return multistep.ActionHalt
-		}
-		application = fmt.Sprintf("/Compute-%s/%s/packer_winRM",
-			config.IdentityDomain, config.Username)
+		application = fmt.Sprintf("packer_winRM_%s", runUUID)
 
-		// Create Access Control List
-		aclClient := client.ACLs()
-		createInput := compute.CreateACLInput{
-			Description: "packer winrm acl",
-			Name:        "PackerWinRMACL",
-		}
-		_, err = aclClient.CreateACL(&createInput)
-		if err != nil {
-			err = fmt.Errorf("Error creating ACL to allow Packer to connect to"+
-				" Oracle instance via %s: %s", commType, err)
-			ui.Error(err.Error())
-			state.Put("error", err)
-			return multistep.ActionHalt
+		applicationGetInput := compute.GetSecurityApplicationInput{
+			Name: namePrefix + application,
 		}
 
-		instanceInfo := state.Get("instance_net").(compute.InstanceInfo)
-		log.Printf("MEGAN instanceInfo is %#v", instanceInfo)
-		log.Printf("MEGAN vnic is %s", instanceInfo.Networking.Vnic)
-
-		// Create vNICset
-		nicSetClient := client.VirtNICSets()
-		nicInput := compute.CreateVirtualNICSetInput{
-			Name:        "PackerWinRM",
-			Description: "allow packer to connect via winRM",
-			VirtualNICs: []string{"eth0"},
-			AppliedACLs: []string{fmt.Sprintf("/Compute-%s/%s/PackerWinRMACL", config.IdentityDomain, config.Username)},
+		_, err = applicationClient.GetSecurityApplication(&applicationGetInput)
+		if err == nil {
+			// Application already exists?
+			log.Printf("Found Security Application %s", application)
+		} else {
+			// Create a security Application defining WinRM
+			if !strings.Contains(err.Error(), "does not exist") {
+				err = fmt.Errorf("Error getting security Application %s", err.Error())
+				ui.Error(err.Error())
+				state.Put("error", err)
+				return multistep.ActionHalt
+			}
+			applicationInput := compute.CreateSecurityApplicationInput{
+				Description: "Allows Packer to connect to instance via winRM",
+				DPort:       "5985-5986",
+				Name:        application,
+				Protocol:    "TCP",
+			}
+			_, err = applicationClient.CreateSecurityApplication(&applicationInput)
+			if err != nil {
+				err = fmt.Errorf("Error creating security application to"+
+					" allow Packer to connect to Oracle instance via %s: %s", commType, err)
+				ui.Error(err.Error())
+				state.Put("error", err)
+				return multistep.ActionHalt
+			}
 		}
-		nicSetClient.CreateVirtualNICSet(&nicInput)
+		state.Put("winrm_application", application)
 	}
 	secRulesClient := client.SecRules()
+	secRuleName := fmt.Sprintf("Packer-allow-%s-Rule_%s_%s", commType,
+		config.ImageName, runUUID)
 	secRulesInput := compute.CreateSecRuleInput{
 		Action:          "PERMIT",
 		Application:     application,
 		Description:     "Packer-generated security rule to allow ssh/winrm",
-		DestinationList: fmt.Sprintf("seclist:%s", secListName),
-		Name:            fmt.Sprintf("Packer-allow-%s-Rule_%s", commType, config.ImageName),
+		DestinationList: "seclist:" + namePrefix + secListName,
+		Name:            namePrefix + secRuleName,
 		SourceList:      config.SSHSourceList,
 	}
 
-	secRuleName := fmt.Sprintf("/Compute-%s/%s/Packer-allow-%s-Rule_%s",
-		config.IdentityDomain, config.Username, commType, config.ImageName)
 	_, err = secRulesClient.CreateSecRule(&secRulesInput)
 	if err != nil {
 		log.Printf("Error creating security rule to allow %s: %s", commType, err.Error())
@@ -148,12 +151,15 @@ func (s *stepSecurity) Run(_ context.Context, state multistep.StateBag) multiste
 func (s *stepSecurity) Cleanup(state multistep.StateBag) {
 	client := state.Get("client").(*compute.ComputeClient)
 	ui := state.Get("ui").(packer.Ui)
+	config := state.Get("config").(*Config)
+
 	ui.Say("Deleting temporary rules and lists...")
 
+	namePrefix := fmt.Sprintf("/Compute-%s/%s/", config.IdentityDomain, config.Username)
 	// delete security rules that Packer generated
 	secRuleName := state.Get("security_rule_name").(string)
 	secRulesClient := client.SecRules()
-	ruleInput := compute.DeleteSecRuleInput{Name: secRuleName}
+	ruleInput := compute.DeleteSecRuleInput{Name: namePrefix + secRuleName}
 	err := secRulesClient.DeleteSecRule(&ruleInput)
 	if err != nil {
 		ui.Say(fmt.Sprintf("Error deleting the packer-generated security rule %s; "+
@@ -163,10 +169,38 @@ func (s *stepSecurity) Cleanup(state multistep.StateBag) {
 	// delete security list that Packer generated
 	secListName := state.Get("security_list").(string)
 	secListClient := client.SecurityLists()
-	input := compute.DeleteSecurityListInput{Name: secListName}
+	input := compute.DeleteSecurityListInput{Name: namePrefix + secListName}
 	err = secListClient.DeleteSecurityList(&input)
 	if err != nil {
 		ui.Say(fmt.Sprintf("Error deleting the packer-generated security list %s; "+
 			"please delete manually. (error : %s)", secListName, err.Error()))
 	}
+
+	// Some extra cleanup if we used the winRM communicator
+	if config.Comm.Type == "winrm" {
+		// Delete the packer-generated protocol
+		protocol := state.Get("winrm_protocol").(string)
+		protocolClient := client.SecurityProtocols()
+		deleteProtocolInput := compute.DeleteSecurityProtocolInput{
+			Name: namePrefix + protocol,
+		}
+		err = protocolClient.DeleteSecurityProtocol(&deleteProtocolInput)
+		if err != nil {
+			ui.Say(fmt.Sprintf("Error deleting the packer-generated winrm security protocol %s; "+
+				"please delete manually. (error : %s)", protocol, err.Error()))
+		}
+
+		// Delete the packer-generated application
+		application := state.Get("winrm_application").(string)
+		applicationClient := client.SecurityApplications()
+		deleteApplicationInput := compute.DeleteSecurityApplicationInput{
+			Name: namePrefix + application,
+		}
+		err = applicationClient.DeleteSecurityApplication(&deleteApplicationInput)
+		if err != nil {
+			ui.Say(fmt.Sprintf("Error deleting the packer-generated winrm security application %s; "+
+				"please delete manually. (error : %s)", application, err.Error()))
+		}
+	}
+
 }

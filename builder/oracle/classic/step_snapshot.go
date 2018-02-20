@@ -3,6 +3,7 @@ package classic
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hashicorp/go-oracle-terraform/compute"
 	"github.com/hashicorp/packer/helper/multistep"
@@ -26,6 +27,7 @@ func (s *stepSnapshot) Run(_ context.Context, state multistep.StateBag) multiste
 	snapshotInput := &compute.CreateSnapshotInput{
 		Instance:     fmt.Sprintf("%s/%s", config.ImageName, instanceID),
 		MachineImage: config.ImageName,
+		Timeout:      time.Minute * 20,
 	}
 
 	snap, err := snapshotClient.CreateSnapshot(snapshotInput)
@@ -33,9 +35,10 @@ func (s *stepSnapshot) Run(_ context.Context, state multistep.StateBag) multiste
 		err = fmt.Errorf("Problem creating snapshot: %s", err)
 		ui.Error(err.Error())
 		state.Put("error", err)
+		state.Put("cleanup_snap", false)
 		return multistep.ActionHalt
 	}
-
+	state.Put("cleanup_snap", true)
 	state.Put("snapshot", snap)
 	ui.Message(fmt.Sprintf("Created snapshot: %s.", snap.Name))
 	return multistep.ActionContinue
@@ -44,6 +47,9 @@ func (s *stepSnapshot) Run(_ context.Context, state multistep.StateBag) multiste
 func (s *stepSnapshot) Cleanup(state multistep.StateBag) {
 	// Delete the snapshot
 	ui := state.Get("ui").(packer.Ui)
+	if !state.Get("cleanup_snap").(bool) {
+		return
+	}
 	ui.Say("Deleting Snapshot...")
 	client := state.Get("client").(*compute.ComputeClient)
 	snap := state.Get("snapshot").(*compute.Snapshot)
